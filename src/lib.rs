@@ -9,7 +9,10 @@ use windows::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS64;
 use windows::Win32::System::SystemServices::IMAGE_DOS_HEADER;
 use windows::Win32::System::SystemServices::IMAGE_EXPORT_DIRECTORY;
 
+#[cfg(target_arch = "x86")]
 pub type WinExecFunc = extern "stdcall" fn(LPCSTR: *const u8, UINT: u32) -> u32;
+#[cfg(target_arch = "x86_64")]
+pub type WinExecFunc = extern "system" fn(LPCSTR: *const u8, UINT: u32) -> u32;
 
 #[inline]
 #[cfg(target_arch = "x86_64")]
@@ -40,90 +43,108 @@ const ENTRY_OFFSET: usize = 16; //-16 is used instead of the CONTAINING_RECORD m
 #[cfg(target_arch = "x86")]
 const ENTRY_OFFSET: usize = 8; //-8 is used instead of the CONTAINING_RECORD macro.
 
-pub fn get_module_handle(lib_name: &str) -> usize {
-    unsafe {
-        #[cfg(target_arch = "x86_64")]
-        let peb = __readgsqword(0x60) as *const Peb;
-        #[cfg(target_arch = "x86")]
-        let peb = __readfsword(0x30) as *const Peb;
-
-        let header = (*(*peb).ldr).in_memory_order_module_list;
-
-        let mut curr = header.flink;
-        curr = (*curr).flink;
-
-        while curr != header.flink {
-            let data = (curr as usize - ENTRY_OFFSET) as *const LdrDataTableEntry;
-            let dll_name_slice = std::slice::from_raw_parts(
-                (*data).base_dll_name.buffer,
-                ((*data).base_dll_name.length / 2) as usize, // /2 because of unicode
-            );
-            let dll_name = String::from_utf16_lossy(dll_name_slice).to_lowercase();
-            if dll_name == lib_name {
-                return (*data).dll_base as usize;
-            }
-            curr = (*curr).flink;
-        }
-    }
-
-    0
+/// Extract DLL name from LdrDataTableEntry, normalized to lowercase
+unsafe fn get_dll_name(entry: *const LdrDataTableEntry) -> String {
+    let dll_name_slice = std::slice::from_raw_parts(
+        (*entry).base_dll_name.buffer,
+        ((*entry).base_dll_name.length / 2) as usize, // /2 because of unicode
+    );
+    String::from_utf16_lossy(dll_name_slice).to_lowercase()
 }
 
+/// Normalize a library name for comparison (lowercase)
+fn normalize_lib_name(lib_name: &str) -> String {
+    lib_name.to_lowercase()
+}
+
+/// Unlink a list entry from a doubly-linked list
+unsafe fn unlink_list_entry(list_entry: *const ListEntry) {
+    let prev = (*list_entry).blink;
+    let next = (*list_entry).flink;
+    if !prev.is_null() {
+        (*prev).flink = next;
+    }
+    if !next.is_null() {
+        (*next).blink = prev;
+    }
+}
+
+/// Iterate through all loaded modules and call callback
+unsafe fn iterate_modules<F>(mut callback: F)
+where
+    F: FnMut(*const LdrDataTableEntry) -> bool,
+{
+    #[cfg(target_arch = "x86_64")]
+    let peb = __readgsqword(0x60) as *const Peb;
+    #[cfg(target_arch = "x86")]
+    let peb = __readfsword(0x30) as *const Peb;
+
+    let header = (*(*peb).ldr).in_memory_order_module_list;
+
+    let mut curr = header.flink;
+    curr = (*curr).flink;
+
+    while curr != header.flink {
+        let data = (curr as usize - ENTRY_OFFSET) as *const LdrDataTableEntry;
+        if !callback(data) {
+            break;
+        }
+        curr = (*curr).flink;
+    }
+}
+
+/// Get the base address of a loaded module by name
+/// 
+/// # Arguments
+/// * `lib_name` - The name of the library (e.g., "kernel32.dll")
+/// 
+/// # Returns
+/// `Some(base_address)` if the module is found, `None` otherwise
+pub fn get_module_handle(lib_name: &str) -> Option<usize> {
+    let lib_name = normalize_lib_name(lib_name);
+    let mut result = None;
+    unsafe {
+        iterate_modules(|entry| {
+            let dll_name = get_dll_name(entry);
+            if dll_name == lib_name {
+                result = Some((*entry).dll_base as usize);
+                return false; // Stop iteration
+            }
+            true // Continue iteration
+        });
+    }
+    result
+}
+
+/// Hide a module from enumeration by unlinking it from all module lists
+/// 
+/// # Arguments
+/// * `lib_name` - The name of the library to hide (e.g., "apphelp.dll")
 pub fn hide_module(lib_name: &str) {
+    let lib_name = normalize_lib_name(lib_name);
     unsafe {
-        #[cfg(target_arch = "x86_64")]
-        let peb = __readgsqword(0x60) as *const Peb;
-        #[cfg(target_arch = "x86")]
-        let peb = __readfsword(0x30) as *const Peb;
-
-        let header = (*(*peb).ldr).in_memory_order_module_list;
-
-        let mut curr = header.flink;
-        curr = (*curr).flink;
-
-        while curr != header.flink {
-            let in_mem_list  = (curr as usize - ENTRY_OFFSET) as *const LdrDataTableEntry;
-            let dll_name_slice = std::slice::from_raw_parts(
-                (*in_mem_list).base_dll_name.buffer,
-                ((*in_mem_list).base_dll_name.length / 2) as usize, // /2 because of unicode
-            );
-            let dll_name = String::from_utf16_lossy(dll_name_slice).to_lowercase();
+        iterate_modules(|entry| {
+            let dll_name = get_dll_name(entry);
             if dll_name == lib_name {
-                let mut prev = (*in_mem_list).in_memory_order_links.blink;
-                let mut next = (*in_mem_list).in_memory_order_links.flink;
-                if !prev.is_null() {
-                    (*prev).flink = next;
-                }
-                if !next.is_null() {
-                    (*next).blink = prev;
-                }
-
-                prev = (*in_mem_list).in_load_order_links.blink;
-                next = (*in_mem_list).in_load_order_links.flink;
-                if !prev.is_null() {
-                    (*prev).flink = next;
-                }
-                if !next.is_null() {
-                    (*next).blink = prev;
-                }
-
-                prev = (*in_mem_list).in_initialization_order_links.blink;
-                next = (*in_mem_list).in_initialization_order_links.flink;
-                if !prev.is_null() {
-                    (*prev).flink = next;
-                }
-                if !next.is_null() {
-                    (*next).blink = prev;
-                }
-
-                break;
+                // Unlink from all three lists
+                unlink_list_entry(&(*entry).in_memory_order_links);
+                unlink_list_entry(&(*entry).in_load_order_links);
+                unlink_list_entry(&(*entry).in_initialization_order_links);
+                return false; // Stop iteration
             }
-            curr = (*curr).flink;
-        }
+            true // Continue iteration
+        });
     }
-
 }
 
+/// Get the address of an exported function from a module
+/// 
+/// # Arguments
+/// * `module_base` - The base address of the loaded module
+/// * `func_name` - The name of the exported function
+/// 
+/// # Returns
+/// The function address if found, 0 otherwise
 pub fn get_func_address(module_base: usize, func_name: &str) -> usize {
     let dos_header = module_base as *const IMAGE_DOS_HEADER;
     #[cfg(target_arch = "x86_64")]
@@ -132,40 +153,35 @@ pub fn get_func_address(module_base: usize, func_name: &str) -> usize {
     #[cfg(target_arch = "x86")]
     let nt_headers =
         unsafe { (module_base + (*dos_header).e_lfanew as usize) as *const IMAGE_NT_HEADERS32 };
-    let optional_headers = (unsafe { *nt_headers }).OptionalHeader;
+    
+    let optional_headers = unsafe { &(*nt_headers).OptionalHeader };
     let export_table_data = optional_headers.DataDirectory[0];
 
     let export_table =
         (module_base + export_table_data.VirtualAddress as usize) as *const IMAGE_EXPORT_DIRECTORY;
-    let array_of_functions = module_base + (unsafe { *export_table }).AddressOfFunctions as usize;
-    let array_of_names = module_base + (unsafe { *export_table }).AddressOfNames as usize;
-    let array_of_names_ordinals =
-        module_base + (unsafe { *export_table }).AddressOfNameOrdinals as usize;
-
+    
     unsafe {
-        for i in 0..(*export_table).NumberOfFunctions {
-            let fn_name_address =
-                module_base + *((array_of_names + (i * 4) as usize) as *const u32) as usize; // * 4 because of size of a DWORD
-            let fn_name =
-                if let Ok(cstr) = CStr::from_ptr(fn_name_address as *const c_char).to_str() {
-                    cstr.to_string()
-                } else {
-                    continue;
-                };
+        let export_dir = &*export_table;
+        let array_of_functions = module_base + export_dir.AddressOfFunctions as usize;
+        let array_of_names = module_base + export_dir.AddressOfNames as usize;
+        let array_of_names_ordinals = module_base + export_dir.AddressOfNameOrdinals as usize;
+
+        for i in 0..export_dir.NumberOfFunctions {
+            let fn_name_address = module_base + *((array_of_names + (i * 4) as usize) as *const u32) as usize;
+            let fn_name = match CStr::from_ptr(fn_name_address as *const c_char).to_str() {
+                Ok(cstr) => cstr,
+                Err(_) => continue,
+            };
+            
             if fn_name == func_name {
-                let num_curr_api_ordinal =
-                    *((array_of_names_ordinals + (i * 2) as usize) as *const u16) as usize; // * 2 because size of a WORD
-                println!(
-                    "[+] Found ordinal {:4x} - {}",
-                    num_curr_api_ordinal + 1,
-                    fn_name
-                );
-                return module_base
-                    + *((array_of_functions + ((num_curr_api_ordinal) * 4)) // * 4 because of size of a DWORD
-                        as *const u32) as usize;
+                let num_curr_api_ordinal = *((array_of_names_ordinals + (i * 2) as usize) as *const u16) as usize;
+                println!("[+] Found ordinal {:4x} - {}", num_curr_api_ordinal + 1, fn_name);
+                
+                return module_base + *((array_of_functions + (num_curr_api_ordinal * 4)) as *const u32) as usize;
             }
         }
     }
+    
     0
 }
 
